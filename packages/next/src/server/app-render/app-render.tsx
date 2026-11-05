@@ -883,7 +883,6 @@ async function generateDynamicFlightRenderResult(
         temporaryReferences: options?.temporaryReferences,
         filterStackFrame,
         debugChannel: debugChannel?.serverSide,
-        localRenderTiming: debugChannel?.localRenderTiming,
         signal: requestAbortSignal,
       }
     )
@@ -920,7 +919,6 @@ async function generateDynamicFlightRenderResult(
         temporaryReferences: options?.temporaryReferences,
         filterStackFrame,
         debugChannel: debugChannel?.serverSide,
-        localRenderTiming: debugChannel?.localRenderTiming,
         signal: requestAbortSignal,
       }
     )
@@ -1451,7 +1449,6 @@ async function generateDynamicFlightRenderResultWithStagesInDev(
         onError: onError,
         filterStackFrame,
         debugChannel: debugChannel?.serverSide,
-        localRenderTiming: debugChannel?.localRenderTiming,
       }
     )
   }
@@ -1910,7 +1907,6 @@ async function finalRuntimeServerPrerender(
           onError,
           signal: finalServerController.signal,
           debugChannel: debugChannel?.serverSide,
-          localRenderTiming: debugChannel?.localRenderTiming,
         }
       )
 
@@ -3862,7 +3858,6 @@ async function renderToStream(
               onError: serverComponentsErrorHandler,
               filterStackFrame,
               debugChannel: debugChannel?.serverSide,
-              localRenderTiming: debugChannel?.localRenderTiming,
             }
           )
           reactServerResult = new ReactServerResult(serverStream)
@@ -4077,7 +4072,6 @@ async function renderToStream(
                 filterStackFrame,
                 onError: serverComponentsErrorHandler,
                 debugChannel: debugChannel?.serverSide,
-                localRenderTiming: debugChannel?.localRenderTiming,
               }
             )
           )
@@ -4120,7 +4114,6 @@ async function renderToStream(
                 filterStackFrame,
                 onError: serverComponentsErrorHandler,
                 debugChannel: debugChannel?.serverSide,
-                localRenderTiming: debugChannel?.localRenderTiming,
               }
             )
           )
@@ -5817,7 +5810,6 @@ async function streamStagedRenderInDev({
             startTime,
             filterStackFrame,
             debugChannel: debugChannel?.serverSide,
-            localRenderTiming: debugChannel?.localRenderTiming,
             signal: requestAbortSignal,
           }
         ) as Readable
@@ -5988,7 +5980,6 @@ async function renderWithWarmCachesForValidationInDev(
           startTime,
           filterStackFrame,
           debugChannel: debugChannel?.serverSide,
-          localRenderTiming: debugChannel?.localRenderTiming,
           signal: validationAbortSignal,
         }
       ) as Readable
@@ -6121,7 +6112,6 @@ async function prerenderWithWarmCachesForStaticValidationInDev(
           startTime,
           filterStackFrame,
           debugChannel: debugChannel?.serverSide,
-          localRenderTiming: debugChannel?.localRenderTiming,
         }
       ) as Readable
 

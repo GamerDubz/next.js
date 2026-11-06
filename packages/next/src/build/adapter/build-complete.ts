@@ -75,6 +75,7 @@ import {
 } from './synthetic-symlinks'
 import { getRouteCacheKey } from '../../server/lib/route-cache-key'
 import { RouteKind } from '../../server/route-kind'
+import { getRscPrerenderCompleteness } from '../../server/lib/prerender-rsc-completeness'
 
 interface SharedRouteFields {
   /**
@@ -163,8 +164,9 @@ interface SharedRouteFields {
 }
 
 /**
- * Classification metadata for the primary response in a prerender group.
- * Related RSC, data, and segment outputs do not expose these fields.
+ * Classification metadata for a prerendered response. App Router HTML and
+ * full-route RSC outputs have independent classifications. Pages Router data
+ * and static segment-prefetch outputs omit these fields.
  */
 type PrerenderClassification =
   | {
@@ -490,6 +492,45 @@ function getPrerenderClassification(
     response,
     compute,
     ...(typeof htmlSize === 'number' && { htmlSize }),
+  }
+}
+
+function getRscPrerenderClassification(
+  route: PrerenderManifestRoute | DynamicPrerenderManifestRoute | undefined
+): PrerenderClassification {
+  if (
+    route === undefined ||
+    route.routeType === undefined ||
+    route.routeType === 'route' ||
+    route.compute === undefined
+  ) {
+    return {}
+  }
+
+  const response = getRscPrerenderCompleteness(route)
+  if (response === undefined) {
+    return {}
+  }
+
+  // The static-output requirement also applies to paths generated on demand.
+  const compute =
+    response === 'complete' || route._isEnsureStaticPage ? 'static' : 'blocking'
+
+  // Explicitly blocking parameter policies require a prerender on a cache miss
+  // even when the result needs per-request rendering. Missing classification
+  // preserves the adapter's default blocking behavior for these outputs.
+  if (
+    compute === 'blocking' &&
+    'isExplicitlyBlocking' in route &&
+    route.isExplicitlyBlocking
+  ) {
+    return {}
+  }
+
+  return {
+    routeType: route.routeType,
+    response,
+    compute,
   }
 }
 
@@ -1815,10 +1856,10 @@ export async function handleBuildComplete({
             bypassToken: previewProps.previewModeId,
           },
         }
-        // Classification describes the primary HTML or Route Handler body,
-        // not the related RSC/data/segment outputs that spread initialOutput.
-        // The shallow spread shares `fallback` by reference, so
-        // handleAppMeta's postponedState mutation still reaches this output.
+        // The primary output uses the HTML or Route Handler classification.
+        // Full-route RSC outputs derive their own classification below. The
+        // shallow spread shares `fallback` by reference, so handleAppMeta's
+        // postponedState mutation still reaches this output.
         outputs.prerenders.push({ ...initialOutput, ...classification })
 
         if (!isAppPage && appPageKeys && appPageKeys.length > 0) {
@@ -1833,6 +1874,9 @@ export async function handleBuildComplete({
         }
 
         if (dataRoute) {
+          const rscClassification = isAppPage
+            ? getRscPrerenderClassification(prerenderManifest.routes[route])
+            : undefined
           const dataFilePath = getPrerenderFilePath(
             route,
             isAppPage,
@@ -1846,6 +1890,7 @@ export async function handleBuildComplete({
           ) {
             outputs.prerenders.push({
               ...initialOutput,
+              ...rscClassification,
               id: dataRoute,
               pathname: dataRoute,
               fallback: {
@@ -1865,6 +1910,7 @@ export async function handleBuildComplete({
           } else {
             outputs.prerenders.push({
               ...initialOutput,
+              ...rscClassification,
               id: dataRoute,
               pathname: dataRoute,
               fallback: isNotFoundTrue
@@ -2078,10 +2124,10 @@ export async function handleBuildComplete({
         }
 
         if (!config.i18n || isAppPage) {
-          // Classification describes only the primary HTML response, not the
-          // related RSC/data/segment outputs that spread initialOutput. The
-          // shallow spread shares `fallback` by reference, so handleAppMeta's
-          // postponedState mutation still reaches this output.
+          // The primary output uses the HTML classification. Full-route RSC
+          // outputs derive their own classification below. The shallow spread
+          // shares `fallback` by reference, so handleAppMeta's postponedState
+          // mutation still reaches this output.
           outputs.prerenders.push({ ...initialOutput, ...classification })
 
           if (
@@ -2141,6 +2187,9 @@ export async function handleBuildComplete({
           if (renderingMode === RenderingMode.PARTIALLY_STATIC) {
             outputs.prerenders.push({
               ...initialOutput,
+              ...getRscPrerenderClassification(
+                prerenderManifest.dynamicRoutes[dynamicRoute]
+              ),
               id: `${dynamicRoute}.rsc`,
               pathname: `${dynamicRoute}.rsc`,
               fallback: {
@@ -2166,6 +2215,11 @@ export async function handleBuildComplete({
           } else if (dataRoute) {
             outputs.prerenders.push({
               ...initialOutput,
+              ...getRscPrerenderClassification(
+                isAppPage
+                  ? prerenderManifest.dynamicRoutes[dynamicRoute]
+                  : undefined
+              ),
               id: dataRoute,
               pathname: dataRoute,
               fallback: undefined,

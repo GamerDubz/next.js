@@ -1,6 +1,14 @@
 import { nextTestSetup } from 'e2e-utils'
 import { retry } from 'next-test-utils'
 
+// Declared by the fixture's `components/probe.tsx`, which the root tsconfig
+// doesn't include; the test reads the same global in the browser.
+declare global {
+  interface Window {
+    __probeCounts?: Record<string, { calls: number; renders: number }>
+  }
+}
+
 type ProbeState = {
   label: string
   hidden: boolean

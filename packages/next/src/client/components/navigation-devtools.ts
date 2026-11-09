@@ -129,10 +129,11 @@ export function createRootNavigationPromises(
 }
 
 /**
- * Nested layout promises are cached by their parent promises and the values of
- * the layout segment promises, not by tree. Navigating back to a route creates
- * a new tree with the same values, and a stable object keeps hidden or
- * restored subtrees from re-rendering (see RouterNavigationState).
+ * Nested layout promises are cached by their parent promises and the slot
+ * names and values of the layout segment promises, not by tree. Navigating
+ * back to a route creates a new tree with the same values, and a stable object
+ * keeps hidden or restored subtrees from re-rendering (see
+ * RouterNavigationState).
  */
 const nestedLayoutPromisesCache = new WeakMap<
   NavigationPromises,
@@ -163,6 +164,7 @@ export function createNestedLayoutNavigationPromises(
   const layoutSegmentPromises = createLayoutSegmentPromises(tree)!
   const cacheKey = JSON.stringify(
     parallelRouteKeys.map((parallelRouteKey) => [
+      parallelRouteKey,
       layoutSegmentPromises.selectedLayoutSegmentPromises.get(parallelRouteKey)!
         .value,
       layoutSegmentPromises.selectedLayoutSegmentsPromises.get(

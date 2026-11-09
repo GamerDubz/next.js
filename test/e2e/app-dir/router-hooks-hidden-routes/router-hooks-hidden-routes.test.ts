@@ -15,14 +15,15 @@ type ProbeState = {
   segmentParams: Record<string, string>
   params: Record<string, string>
   pathname: string
+  search: string
   calls: number
   renders: number
 }
 
 // With Cache Components, every layout slot keeps up to 3 recently active
 // segments mounted, the inactive ones inside `<Activity mode="hidden">`.
-// Inside a hidden tree, `useParams()` and `usePathname()` return the values the
-// tree had when it was hidden, which are the values it gets again when
+// Inside a hidden tree, `useParams()`, `usePathname()` and `useSearchParams()`
+// return the values the tree had when it was hidden, which are the values it gets again when
 // navigating back to it. So hidden trees don't re-render when the active route
 // changes, and a tree shown again with the same values doesn't re-render
 // either.
@@ -47,6 +48,7 @@ describe('router-hooks-hidden-routes', () => {
           segmentParams: JSON.parse(el.dataset.segmentParams!),
           params: JSON.parse(el.dataset.params!),
           pathname: el.dataset.pathname!,
+          search: el.dataset.search!,
           ...(window.__probeCounts?.[
             `${el.dataset.probe}:${el.dataset.segmentParams}`
           ] ?? { calls: 0, renders: 0 }),
@@ -118,6 +120,7 @@ describe('router-hooks-hidden-routes', () => {
           segmentParams: { team: 'acme', project: 'b' },
           params: { team: 'acme', project: 'b' },
           pathname: '/acme/b',
+          search: '',
         },
         {
           label: 'team-layout',
@@ -125,6 +128,7 @@ describe('router-hooks-hidden-routes', () => {
           segmentParams: { team: 'acme' },
           params: { team: 'acme', project: 'b' },
           pathname: '/acme/b',
+          search: '',
         },
         {
           label: 'project-page',
@@ -132,6 +136,7 @@ describe('router-hooks-hidden-routes', () => {
           segmentParams: { team: 'acme', project: 'a' },
           params: { team: 'acme', project: 'a' },
           pathname: '/acme/a',
+          search: '',
         },
       ])
     })
@@ -157,6 +162,7 @@ describe('router-hooks-hidden-routes', () => {
           segmentParams: {},
           params: {},
           pathname: '/account',
+          search: '',
         },
         {
           label: 'project-page',
@@ -164,6 +170,7 @@ describe('router-hooks-hidden-routes', () => {
           segmentParams: { team: 'acme', project: 'a' },
           params: { team: 'acme', project: 'a' },
           pathname: '/acme/a',
+          search: '',
         },
         {
           label: 'project-page',
@@ -171,6 +178,7 @@ describe('router-hooks-hidden-routes', () => {
           segmentParams: { team: 'acme', project: 'b' },
           params: { team: 'acme', project: 'b' },
           pathname: '/acme/b',
+          search: '',
         },
         {
           label: 'team-layout',
@@ -178,6 +186,7 @@ describe('router-hooks-hidden-routes', () => {
           segmentParams: { team: 'acme' },
           params: { team: 'acme', project: 'b' },
           pathname: '/acme/b',
+          search: '',
         },
       ])
     })
@@ -203,6 +212,7 @@ describe('router-hooks-hidden-routes', () => {
           segmentParams: { team: 'acme', project: 'b' },
           params: { team: 'acme', project: 'b' },
           pathname: '/acme/b',
+          search: '',
         },
         {
           label: 'team-layout',
@@ -210,6 +220,7 @@ describe('router-hooks-hidden-routes', () => {
           segmentParams: { team: 'acme' },
           params: { team: 'acme', project: 'b' },
           pathname: '/acme/b',
+          search: '',
         },
         {
           label: 'account-page',
@@ -217,6 +228,7 @@ describe('router-hooks-hidden-routes', () => {
           segmentParams: {},
           params: {},
           pathname: '/account',
+          search: '',
         },
         {
           label: 'project-page',
@@ -224,6 +236,7 @@ describe('router-hooks-hidden-routes', () => {
           segmentParams: { team: 'acme', project: 'a' },
           params: { team: 'acme', project: 'a' },
           pathname: '/acme/a',
+          search: '',
         },
       ])
     })
@@ -237,6 +250,108 @@ describe('router-hooks-hidden-routes', () => {
         'team-layout acme': 'bailout',
         'project-page acme/a': 'bailout',
         'project-page acme/b': 'bailout',
+      })
+    })
+
+    // /acme/b → /acme/a?x=1: project page `a` is shown again, but with
+    // different search params than it was hidden with, so it re-renders.
+    await browser.elementByCss('a[href="/acme/a?x=1"]').click()
+    await retry(async () => {
+      expect(await readValues(browser)).toEqual([
+        {
+          label: 'project-page',
+          hidden: false,
+          segmentParams: { team: 'acme', project: 'a' },
+          params: { team: 'acme', project: 'a' },
+          pathname: '/acme/a',
+          search: 'x=1',
+        },
+        {
+          label: 'team-layout',
+          hidden: false,
+          segmentParams: { team: 'acme' },
+          params: { team: 'acme', project: 'a' },
+          pathname: '/acme/a',
+          search: 'x=1',
+        },
+        {
+          label: 'account-page',
+          hidden: true,
+          segmentParams: {},
+          params: {},
+          pathname: '/account',
+          search: '',
+        },
+        {
+          label: 'project-page',
+          hidden: true,
+          segmentParams: { team: 'acme', project: 'b' },
+          params: { team: 'acme', project: 'b' },
+          pathname: '/acme/b',
+          search: '',
+        },
+      ])
+    })
+    await waitForIdle(browser)
+    let onAWithSearch: ProbeState[] = []
+    await retry(async () => {
+      onAWithSearch = await readProbes(browser)
+      expect(rerendered(backOnB, onAWithSearch)).toEqual({
+        // Shown again with different values.
+        'project-page acme/a': 'render',
+        'team-layout acme': 'render',
+        'account-page': 'bailout',
+        'project-page acme/b': 'bailout',
+      })
+    })
+
+    // Back to /acme/b: project page `a` is hidden with its search params, and
+    // `b` is shown again with the values it was hidden with. (A link click
+    // would refetch the page in dev and re-render it with new elements.)
+    await browser.back()
+    await retry(async () => {
+      expect(await readValues(browser)).toEqual([
+        {
+          label: 'project-page',
+          hidden: false,
+          segmentParams: { team: 'acme', project: 'b' },
+          params: { team: 'acme', project: 'b' },
+          pathname: '/acme/b',
+          search: '',
+        },
+        {
+          label: 'team-layout',
+          hidden: false,
+          segmentParams: { team: 'acme' },
+          params: { team: 'acme', project: 'b' },
+          pathname: '/acme/b',
+          search: '',
+        },
+        {
+          label: 'account-page',
+          hidden: true,
+          segmentParams: {},
+          params: {},
+          pathname: '/account',
+          search: '',
+        },
+        {
+          label: 'project-page',
+          hidden: true,
+          segmentParams: { team: 'acme', project: 'a' },
+          params: { team: 'acme', project: 'a' },
+          pathname: '/acme/a',
+          search: 'x=1',
+        },
+      ])
+    })
+    await waitForIdle(browser)
+    await retry(async () => {
+      expect(rerendered(onAWithSearch, await readProbes(browser))).toEqual({
+        'project-page acme/b': 'bailout',
+        'team-layout acme': 'render',
+        'account-page': 'bailout',
+        'project-page acme/a': 'bailout',
       })
     })
   })

@@ -84,13 +84,22 @@ const providerCases = (
     name: `${sampler} sampler, ${distDir} output`,
     sampler,
     distDir,
+    toolingGate: process.env.NEXT_EXPERIMENTAL_OTEL_TOOLING ?? '1',
   }))
 )
+if (isNextDev) {
+  providerCases.push({
+    name: 'disabled tooling, .next output',
+    sampler: 'on',
+    distDir: '.next',
+    toolingGate: '0',
+  })
+}
 
 // Local files, local collector, and CLI process shutdown are self-hosted contracts.
 // @force-gate !deploy
 describe('experimental tooling OTel', () => {
-  describe.each(providerCases)('$name', ({ sampler, distDir }) => {
+  describe.each(providerCases)('$name', ({ sampler, distDir, toolingGate }) => {
     let startCommand: string | undefined
     if (isNextDev) {
       const bundlerFlag = process.env.IS_WEBPACK_TEST
@@ -104,8 +113,7 @@ describe('experimental tooling OTel', () => {
       startCommand,
       dependencies,
       env: {
-        NEXT_EXPERIMENTAL_OTEL_TOOLING:
-          process.env.NEXT_EXPERIMENTAL_OTEL_TOOLING ?? '1',
+        NEXT_EXPERIMENTAL_OTEL_TOOLING: toolingGate,
         NEXT_EXIT_TIMEOUT_MS: '30000',
         TOOLING_SAMPLER: sampler,
       },
@@ -163,11 +171,44 @@ describe('experimental tooling OTel', () => {
         await browser.close()
       }
       const editFinishedAt = Date.now()
+      if (
+        isNextDev &&
+        sampler === 'on' &&
+        next.env.NEXT_EXPERIMENTAL_OTEL_TOOLING === '1'
+      ) {
+        await retry(async () => {
+          const exported = messages.flatMap((message) => message.spans ?? [])
+          expect(exported).toEqual(
+            expect.arrayContaining([
+              expect.objectContaining({
+                name: 'client-hmr-latency',
+                attributes: expect.objectContaining({ page: '/' }),
+              }),
+              expect.objectContaining({ name: 'compile-path' }),
+            ])
+          )
+        }, 15000)
+        expect(messages.filter((message) => message.kind === 'flush')).toEqual(
+          []
+        )
+      }
       await next.stop('SIGTERM')
       const local = parseTraceFile(
         join(next.testDir, next.env.TOOLING_TRACE_FILE)
       ).events
       expectTraceEventContract(local)
+      if (isNextDev) {
+        expect(local.map((event) => event.name)).toEqual(
+          expect.arrayContaining([
+            'start-dev-server',
+            'setup-dev-bundler',
+            'hot-reloader',
+            'compile-path',
+            'client-hmr-latency',
+            ...(process.env.IS_WEBPACK_TEST ? ['webpack-compilation'] : []),
+          ])
+        )
+      }
       const clientEvent = local
         .filter(
           (event) =>
@@ -243,17 +284,12 @@ describe('experimental tooling OTel', () => {
         return
       }
       if (isNextDev) {
-        const exportedClient = tooling.find(
-          (span) => span.attributes['next.tooling.id'] === clientEvent!.id
-        )
-        expect(exportedClient?.name).toBe('client-hmr-latency')
-        for (const [key, value] of Object.entries(clientEvent!.tags)) {
-          // The existing SDK adapter JSON-encodes arrays/objects; local tags
-          // retain supported arrays. Do not change either encoding for HMR.
-          expect(exportedClient!.attributes[key]).toEqual(
-            typeof value === 'object' ? JSON.stringify(value) : value
-          )
-        }
+        const expected = local.filter((event) => selectedNames.has(event.name))
+        expect(
+          tooling
+            .map((span) => span.attributes['next.tooling.id'] as number)
+            .sort((a, b) => a - b)
+        ).toEqual(expected.map((event) => event.id).sort((a, b) => a - b))
       }
       expect(tooling.map((span) => span.name)).toContain(rootName)
       const root = tooling.find((span) => span.name === rootName)!
@@ -322,6 +358,13 @@ describe('experimental tooling OTel', () => {
         )!
         expect(event).toBeDefined()
         expect(event.name).toBe(span.name)
+        if (isNextDev) {
+          for (const [key, value] of Object.entries(event.tags)) {
+            expect(span.attributes[key]).toEqual(
+              typeof value === 'object' ? JSON.stringify(value) : value
+            )
+          }
+        }
         expect(span.attributes['next.tooling.parent_id']).toBe(event.parentId)
         expect(
           Math.abs(milliseconds(span.startTime) - event.startTime!)

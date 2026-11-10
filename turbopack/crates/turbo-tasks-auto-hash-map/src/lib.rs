@@ -1,9 +1,11 @@
 pub mod map;
 pub mod set;
+pub mod sorted_set;
 pub mod tiny_vec;
 
 pub use map::AutoMap;
 pub use set::AutoSet;
+pub use sorted_set::SortedSet;
 pub use tiny_vec::TinyVec;
 
 // Values based on data from https://github.com/yegor256/micromap#benchmark

@@ -13,7 +13,7 @@ use swc_core::{
 use thread_local::ThreadLocal;
 use tracing::instrument;
 use turbo_rcstr::{RcStr, rcstr};
-use turbo_tasks::{NonLocalValue, ResolvedVc, TryJoinIterExt, Vc};
+use turbo_tasks::{FxIndexMap, NonLocalValue, ResolvedVc, TryJoinIterExt, Vc};
 use turbo_tasks_fs::FileSystemPath;
 use turbopack_core::{
     compile_time_info::{CompileTimeDefineValue, CompileTimeInfo},
@@ -129,7 +129,8 @@ enum ConstantsModuleExport {
 #[turbo_tasks::value]
 #[derive(Debug)]
 struct ConstantsModule {
-    exports: Vec<(RcStr, ConstantsModuleExport)>,
+    #[bincode(with = "turbo_bincode::indexmap")]
+    exports: FxIndexMap<RcStr, ConstantsModuleExport>,
     has_directive: bool,
 }
 
@@ -173,7 +174,7 @@ impl ConstantsModule {
                                         AutomaticInlineStatus::HasIdentity => {
                                             JsValue::unknown_empty(
                                                 false,
-                                                rcstr!("regex not inlined"),
+                                                rcstr!("value has identity"),
                                             )
                                         }
                                     }
@@ -216,9 +217,7 @@ pub async fn get_inline_export(
     let Some(constants) = constants.as_ref() else {
         return Ok(None);
     };
-    let Some((_, ConstantsModuleExport::Constant(value))) =
-        constants.exports.iter().find(|(name, _)| name == export)
-    else {
+    let Some(ConstantsModuleExport::Constant(value)) = constants.exports.get(export) else {
         return Ok(None);
     };
     if !matches!(
@@ -390,7 +389,7 @@ pub async fn get_constants(
         .await?;
 
     Ok(Vc::cell(Some(ConstantsModule {
-        exports,
+        exports: exports.into_iter().collect(),
         has_directive: directives.constants_module,
     })))
 }

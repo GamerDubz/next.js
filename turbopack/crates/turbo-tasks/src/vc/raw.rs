@@ -42,7 +42,7 @@ use crate::{
 /// bits 21..=0  (22 bits): cell index
 /// ```
 /// Because the `ValueTypeId` is always `>= 1`, the type is trivially non-zero
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct CellId(NonZeroU32);
 
 // The `ValueTypeId` occupies the high bits, so the packed word is always `>= 2^22` and a varint

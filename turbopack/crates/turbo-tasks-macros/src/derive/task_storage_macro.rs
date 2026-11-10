@@ -3420,11 +3420,13 @@ fn extract_option_inner_type(ty: &Type) -> TokenStream {
     quote! { #ty }
 }
 
-/// Extract the element type `K` from `AutoSet<K>` (which is `FxHashSet<K>`)
+/// Extract the element type `K` from `AutoSet<K>` (which is `FxHashSet<K>`) or `SortedSet<K>`
 fn extract_set_element_type(ty: &Type) -> Option<TokenStream> {
     if let Type::Path(type_path) = ty
         && let Some(segment) = type_path.path.segments.last()
-        && (segment.ident == "AutoSet" || segment.ident == "FxHashSet")
+        && (segment.ident == "AutoSet"
+            || segment.ident == "FxHashSet"
+            || segment.ident == "SortedSet")
         && let syn::PathArguments::AngleBracketed(args) = &segment.arguments
         && let Some(syn::GenericArgument::Type(inner)) = args.args.first()
     {

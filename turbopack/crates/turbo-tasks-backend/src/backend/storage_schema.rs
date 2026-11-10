@@ -41,6 +41,7 @@ use crate::{
 
 type TinyVec<T, const MAX: usize> = auto_hash_map::TinyVec<T, 0, MAX>;
 type AutoSet<K, const I: usize> = auto_hash_map::AutoSet<K, BuildHasherDefault<FxHasher>, I>;
+type SortedSet<T, const I: usize> = auto_hash_map::SortedSet<T, I>;
 
 /// Auto-map storage for key-value pairs.
 ///
@@ -249,7 +250,7 @@ struct TaskStorageSchema {
         filter_transient,
         shrink_on_completion
     )]
-    children: AutoSet<TaskId, 6>,
+    children: SortedSet<TaskId, 6>,
 
     /// Follower nodes in the aggregation tree (reference counted).
     #[field(storage = "counter_map", category = "meta", filter_transient)]
@@ -265,7 +266,7 @@ struct TaskStorageSchema {
         shrink_on_completion,
         drop_on_completion_if_immutable
     )]
-    output_dependencies: AutoSet<TaskId, 6>,
+    output_dependencies: SortedSet<TaskId, 6>,
 
     /// Cells this task depends on as a whole (keyless). The common case; kept separate from
     /// `cell_dependencies_keyed` so it stores a bare `CellRef` instead of a `(CellRef, CellKey)`
@@ -277,7 +278,7 @@ struct TaskStorageSchema {
         shrink_on_completion,
         drop_on_completion_if_immutable
     )]
-    cell_dependencies: AutoSet<CellRef, 3>,
+    cell_dependencies: SortedSet<CellRef, 3>,
 
     /// Cells this task depends on with a `CellKey`. Rare.
     /// - `CellKeyKind::Hash`: narrowed to a hashed sub-value, only invalidated when it changes.
@@ -294,7 +295,7 @@ struct TaskStorageSchema {
         shrink_on_completion,
         drop_on_completion_if_immutable
     )]
-    cell_dependencies_keyed: AutoSet<(CellRef, CellKey), 1>,
+    cell_dependencies_keyed: SortedSet<(CellRef, CellKey), 1>,
 
     /// Collectibles this task depends on.
     #[field(
@@ -304,7 +305,7 @@ struct TaskStorageSchema {
         shrink_on_completion,
         drop_on_completion_if_immutable
     )]
-    collectibles_dependencies: AutoSet<CollectiblesRef, 3>,
+    collectibles_dependencies: SortedSet<CollectiblesRef, 3>,
 
     /// Outdated output dependencies to be cleaned up (transient).
     #[field(storage = "auto_set", category = "transient", drop_on_completion)]
@@ -1038,6 +1039,12 @@ where
         self.extend(items)
     }
 }
+impl<V: Copy + Ord, const I: usize> MergeRestore for SortedSet<V, I> {
+    type Item = V;
+    fn merge_restore(&mut self, items: impl IntoIterator<Item = Self::Item>) {
+        self.extend(items)
+    }
+}
 
 /// Outcome of a `drop_partial` call: did residue (transient entries that
 /// can't be reconstructed from disk) survive the drop?
@@ -1073,6 +1080,18 @@ impl<T: IsTransient> DropPartial for Option<T> {
 }
 
 impl<T: IsTransient + Hash + Eq, const I: usize> DropPartial for AutoSet<T, I> {
+    fn drop_partial(&mut self) -> DropPartialOutcome {
+        self.retain(|t| t.is_transient());
+        if self.is_empty() {
+            DropPartialOutcome::Empty
+        } else {
+            self.shrink_to_fit();
+            DropPartialOutcome::HasResidue
+        }
+    }
+}
+
+impl<T: IsTransient + Copy + Ord, const I: usize> DropPartial for SortedSet<T, I> {
     fn drop_partial(&mut self) -> DropPartialOutcome {
         self.retain(|t| t.is_transient());
         if self.is_empty() {

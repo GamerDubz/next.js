@@ -361,7 +361,7 @@ pub enum ReadConsistency {
 /// hash keeps 63 bits. Keyed dependencies are stored per dependent and per dependency, so this
 /// halves their key from the 16 bytes an enum of a `u64` and a `u32` would take. Always build
 /// keys with [`CellKey::hash`] and [`CellKey::provisional`] so equal keys compare equal.
-#[derive(Clone, Copy, Eq, PartialEq, Hash, Encode, Decode)]
+#[derive(Clone, Copy, Eq, PartialEq, PartialOrd, Ord, Hash, Encode, Decode)]
 #[repr(transparent)]
 pub struct CellKey(#[bincode(fixint)] u64);
 

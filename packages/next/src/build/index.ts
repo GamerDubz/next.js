@@ -271,7 +271,10 @@ interface PrerenderManifestClassification {
   /** The completeness of the prerendered response. */
   response?: PrerenderResponse
 
-  /** The per-request compute needed to serve this prerender. */
+  /**
+   * The per-request compute needed to serve this prerender. This excludes
+   * generating or revalidating the prerender.
+   */
   compute?: PrerenderCompute
 
   /** The byte size of this route's prerendered HTML. */
@@ -4072,7 +4075,9 @@ export default async function build(
                     classification = {
                       routeType: 'page',
                       response: 'empty',
-                      compute: 'blocking',
+                      // `ensureStatic = 'navigation'` also requires complete
+                      // static server output for paths generated on demand.
+                      compute: isEnsureStaticPage ? 'static' : 'blocking',
                     }
                   }
                 }

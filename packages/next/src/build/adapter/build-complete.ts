@@ -191,12 +191,15 @@ type PrerenderClassification =
       response: 'empty' | 'initial' | 'complete'
 
       /**
-       * The request-time compute needed to serve the completed response.
+       * The request-time compute needed to serve the completed response. This
+       * excludes generating or revalidating the prerender.
        *
-       * - `blocking`: compute must finish before a response can be served.
+       * - `blocking`: no initial response is available before compute starts.
        * - `resuming`: an initial response is served while postponed work
        *   resumes on the server.
        * - `static`: no server compute is required per request.
+       *
+       * A blocking response can stream while compute continues.
        */
       compute: 'blocking' | 'resuming' | 'static'
 

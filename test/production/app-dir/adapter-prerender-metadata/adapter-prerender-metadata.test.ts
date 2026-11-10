@@ -15,6 +15,7 @@ const validClassifications: Classification[] = [
   { routeType: 'page', response: 'complete', compute: 'static' },
   { routeType: 'page', response: 'initial', compute: 'static' },
   { routeType: 'page', response: 'initial', compute: 'resuming' },
+  { routeType: 'page', response: 'empty', compute: 'static' },
   { routeType: 'page', response: 'empty', compute: 'blocking' },
   { routeType: 'shell', response: 'complete', compute: 'static' },
   { routeType: 'shell', response: 'initial', compute: 'static' },
@@ -89,6 +90,13 @@ describe('adapter-prerender-metadata', () => {
         routeType: 'page',
         response: 'initial',
         compute: 'resuming',
+      },
+      {
+        pathname: '/ensure-static/[slug]',
+        manifestSection: 'dynamicRoutes',
+        routeType: 'page',
+        response: 'empty',
+        compute: 'static',
       },
       {
         pathname: '/empty-shell',

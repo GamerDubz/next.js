@@ -189,11 +189,13 @@ ISR-enabled routes and static prerenders:
 - `initial`: an initial response can be served, but it is not the completed page UI. In practice, this only applies to UI routes that are partially prerenderable
 - `complete`: the response is complete; this can include a zero-byte response body, such as a `204` Route Handler response
 
-`compute` describes the request-time compute needed to serve the completed response:
+`compute` describes the per-request compute needed to serve the completed response. It excludes generating or revalidating the prerender:
 
 - `blocking`: no initial response can be sent before request-time compute starts; once started, the response can stream while compute continues
 - `resuming`: an initial response is served while postponed work resumes on the server
 - `static`: no server compute is required per request
+
+Routes with `ensureStatic = 'navigation'` use `response: 'empty'` and `compute: 'static'` for HTML outputs that cover paths not generated at build time, such as `/products/[slug]`. These outputs have no fallback response. The platform must wait for Next.js to prerender a new path before serving its response. The generated output needs no per-request server rendering. If the path requires dynamic server work, prerendering fails validation instead. Concrete built paths also use `compute: 'static'`. Their `response` can be `complete`, or `initial` when UI finishes in the browser.
 
 `htmlSize` is only included on the primary App Router HTML output. A value of `0` means that the HTML shell is empty. Pages Router prerenders, Route Handlers, and related RSC, data, and segment outputs omit it.
 

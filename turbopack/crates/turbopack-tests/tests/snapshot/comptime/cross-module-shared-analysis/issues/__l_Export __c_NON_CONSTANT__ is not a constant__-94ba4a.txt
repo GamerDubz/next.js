@@ -1,4 +1,4 @@
-error - [analysis] /turbopack/crates/turbopack-tests/tests/snapshot/comptime/cross-module-shared-analysis/input/other.js:6:0  Export NON_CONSTANT is not a constant
+error - [analysis] /turbopack/crates/turbopack-tests/tests/snapshot/comptime/cross-module-shared-analysis/input/other.js:6:1  Export NON_CONSTANT is not a constant
   
        2 | 
        3 | export default 'dev'

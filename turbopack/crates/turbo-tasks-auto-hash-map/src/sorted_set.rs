@@ -1,19 +1,22 @@
-//! A set of `Copy + Ord` values stored as sorted arrays, for sets that are built once and then
-//! mostly read, like a task's forward dependency edges.
+//! A set of `Copy + Ord` values stored as a sorted array once built, for sets that are built once
+//! and then mostly read, like a task's forward dependency edges.
 //!
 //! A finished set stores exactly its elements: no empty buckets, control bytes or power-of-two
-//! rounding as in a hash table. Lookups are binary searches, which for the small integer keys these
-//! sets hold are about as fast as hashing up to thousands of elements, and iteration is in order.
+//! rounding as in a hash table. Lookups are binary searches, and iteration is in order.
 //!
 //! # Representation
 //! * Up to `INLINE` elements are stored inline, sorted.
 //! * Past that, the elements live in a heap allocation behind a thin pointer, after a small header
-//!   holding the capacity and the length of the *main* run. The elements are the sorted main run
-//!   followed by a sorted *tail* of recent insertions. Inserting into the middle of a large array
-//!   costs O(n), so insertions go into the (short) tail instead, which is merged into the main run
-//!   once it outgrows about `sqrt(len)`. Inserting in ascending order, the common case for freshly
-//!   allocated ids, extends the main run directly. Lookups search both runs.
-//! * [`SortedSet::shrink_to_fit`] merges the tail and drops spare capacity. A set shrunk to at most
+//!   holding the capacity and the length of the sorted *main* run. The elements are the main run
+//!   followed by a short sorted *tail* of recent insertions, merged into the main run once full.
+//!   Inserting in ascending order, the common case for freshly allocated ids, extends the main run
+//!   directly.
+//! * A sorted array is a poor structure to build a large set in random order: each insertion moves
+//!   elements. So a set that is still growing past 32 elements (`MAX_MERGED_LEN`) switches to a
+//!   hash table, and [`SortedSet::shrink_to_fit`] (called once the set is complete) sorts it back
+//!   into an exactly sized array. Building a set then costs about as much as building a hash set,
+//!   plus one sort.
+//! * `shrink_to_fit` also merges the tail and drops spare capacity. A set shrunk to at most
 //!   `INLINE` elements moves back inline.
 //!
 //! The encoded form (the length, then the elements) is the same as an [`AutoSet`]'s.
@@ -23,6 +26,7 @@
 use std::{
     alloc::{self, Layout},
     fmt::{self, Debug},
+    hash::{BuildHasherDefault, Hash},
     mem::{ManuallyDrop, MaybeUninit},
     ptr::{self, NonNull},
     slice,
@@ -35,25 +39,37 @@ use bincode::{
     error::{DecodeError, EncodeError},
     impl_borrow_decode,
 };
+use rustc_hash::FxHasher;
 use shrink_to_fit::ShrinkToFit;
 
-/// Set in [`SortedSet::len`] while the elements live on the heap.
+/// The hash table form. A map, as only hashbrown's maps report their allocation size.
+type HashSet<T> = hashbrown::HashMap<T, (), BuildHasherDefault<FxHasher>>;
+
+/// Set in [`SortedSet::len`] while the elements live in a sorted heap allocation.
 const SPILLED: u32 = 1 << 31;
+/// Set in [`SortedSet::len`] while the elements live in a hash table.
+const HASHED: u32 = 1 << 30;
 /// The largest number of elements a set can hold.
-const MAX_LEN: usize = (SPILLED - 1) as usize;
-/// The tail is merged into the main run once longer than this or `sqrt(len)`.
-const MIN_TAIL: usize = 16;
+const MAX_LEN: usize = (HASHED - 1) as usize;
+/// The tail is merged into the main run once longer than this.
+const MAX_TAIL: usize = 16;
+/// A sorted set whose tail is full switches to a hash table instead of merging once it holds more
+/// than this many elements, as merging moves the whole array.
+const MAX_MERGED_LEN: usize = 32;
 
 pub struct SortedSet<T, const INLINE: usize = 0> {
-    /// The number of elements, with [`SPILLED`] set while they live on the heap.
+    /// The number of inline or sorted elements, with [`SPILLED`] set while they live in a sorted
+    /// heap allocation. Just [`HASHED`] while they live in a hash table.
     len: u32,
     data: Data<T, INLINE>,
 }
 
 union Data<T, const INLINE: usize> {
     inline: ManuallyDrop<[MaybeUninit<T>; INLINE]>,
-    /// Valid while spilled: a [`Header`] followed by `cap` element slots.
+    /// Valid while [`SPILLED`]: a [`Header`] followed by `cap` element slots.
     heap: NonNull<Header>,
+    /// Valid while [`HASHED`]: a boxed hash table.
+    table: NonNull<HashSet<T>>,
 }
 
 /// The start of a spilled set's allocation.
@@ -75,6 +91,42 @@ impl<T, const INLINE: usize> Default for SortedSet<T, INLINE> {
     }
 }
 
+/// An iterator over a [`SortedSet`]'s elements: in order once the set is complete.
+pub enum Iter<'a, T> {
+    Slice(slice::Iter<'a, T>),
+    Table(hashbrown::hash_map::Keys<'a, T, ()>),
+}
+
+impl<'a, T> Iterator for Iter<'a, T> {
+    type Item = &'a T;
+
+    #[inline]
+    fn next(&mut self) -> Option<&'a T> {
+        match self {
+            Iter::Slice(iter) => iter.next(),
+            Iter::Table(iter) => iter.next(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Iter::Slice(iter) => iter.size_hint(),
+            Iter::Table(iter) => iter.size_hint(),
+        }
+    }
+}
+
+impl<T> ExactSizeIterator for Iter<'_, T> {}
+
+impl<T> Clone for Iter<'_, T> {
+    fn clone(&self) -> Self {
+        match self {
+            Iter::Slice(iter) => Iter::Slice(iter.clone()),
+            Iter::Table(iter) => Iter::Table(iter.clone()),
+        }
+    }
+}
+
 impl<T, const INLINE: usize> SortedSet<T, INLINE> {
     pub const fn new() -> Self {
         Self {
@@ -86,18 +138,50 @@ impl<T, const INLINE: usize> SortedSet<T, INLINE> {
     }
 
     #[inline]
-    pub const fn len(&self) -> usize {
-        (self.len & !SPILLED) as usize
-    }
-
-    #[inline]
-    pub const fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    #[inline]
     const fn is_spilled(&self) -> bool {
         self.len & SPILLED != 0
+    }
+
+    #[inline]
+    const fn is_hashed(&self) -> bool {
+        self.len & HASHED != 0
+    }
+
+    /// Whether the elements are in a hash table, i.e. the set grew large and isn't complete yet.
+    pub const fn is_hash_table(&self) -> bool {
+        self.is_hashed()
+    }
+
+    fn table(&self) -> Option<&HashSet<T>> {
+        if self.is_hashed() {
+            // SAFETY: while hashed, `table` points to a live boxed table owned by `self`. Checked
+            // first: the field is only valid while hashed.
+            Some(unsafe { self.data.table.as_ref() })
+        } else {
+            None
+        }
+    }
+
+    fn table_mut(&mut self) -> Option<&mut HashSet<T>> {
+        if self.is_hashed() {
+            // SAFETY: see `table`.
+            Some(unsafe { self.data.table.as_mut() })
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        match self.table() {
+            Some(table) => table.len(),
+            None => (self.len & !SPILLED) as usize,
+        }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// The layout of an allocation with room for `cap` elements, and the offset of the elements.
@@ -127,7 +211,9 @@ impl<T, const INLINE: usize> SortedSet<T, INLINE> {
         unsafe { self.data.heap.as_mut() }
     }
 
+    /// The first inline or sorted element. Must not be hashed.
     fn as_ptr(&self) -> *const T {
+        debug_assert!(!self.is_hashed());
         if self.is_spilled() {
             // SAFETY: spilled, and the elements follow the header at `elements_offset`.
             unsafe {
@@ -139,12 +225,13 @@ impl<T, const INLINE: usize> SortedSet<T, INLINE> {
                     .cast::<T>()
             }
         } else {
-            // SAFETY: not spilled, so `inline` is the active field.
+            // SAFETY: not spilled or hashed, so `inline` is the active field.
             unsafe { self.data.inline.as_ptr().cast::<T>() }
         }
     }
 
     fn as_mut_ptr(&mut self) -> *mut T {
+        debug_assert!(!self.is_hashed());
         if self.is_spilled() {
             // A heap pointer carries the allocation's provenance, so going through `as_ptr` is
             // fine.
@@ -156,8 +243,9 @@ impl<T, const INLINE: usize> SortedSet<T, INLINE> {
         }
     }
 
-    /// All elements: the sorted main run followed by the sorted tail.
-    pub fn as_slice(&self) -> &[T] {
+    /// The inline or sorted elements: the sorted main run followed by the sorted tail. Must not be
+    /// hashed.
+    fn sorted_slice(&self) -> &[T] {
         // SAFETY: the first `len` elements are initialized.
         unsafe { slice::from_raw_parts(self.as_ptr(), self.len()) }
     }
@@ -172,16 +260,19 @@ impl<T, const INLINE: usize> SortedSet<T, INLINE> {
         }
     }
 
-    /// The sorted main run and the sorted tail.
+    /// The sorted main run and the sorted tail. Must not be hashed.
     fn runs(&self) -> (&[T], &[T]) {
-        self.as_slice().split_at(self.main_len())
+        self.sorted_slice().split_at(self.main_len())
     }
 
-    pub fn iter(&self) -> slice::Iter<'_, T> {
-        self.as_slice().iter()
+    pub fn iter(&self) -> Iter<'_, T> {
+        match self.table() {
+            Some(table) => Iter::Table(table.keys()),
+            None => Iter::Slice(self.sorted_slice().iter()),
+        }
     }
 
-    /// The capacity of the heap allocation, or `0` while inline.
+    /// The capacity of the sorted heap allocation, or `0` otherwise.
     fn heap_capacity(&self) -> usize {
         if self.is_spilled() {
             // SAFETY: spilled.
@@ -191,18 +282,16 @@ impl<T, const INLINE: usize> SortedSet<T, INLINE> {
         }
     }
 
-    /// Bytes of the heap allocation, `0` while inline. Excludes heap memory owned by the elements.
-    pub fn heap_size(&self) -> usize {
-        if self.is_spilled() {
-            Self::layout(self.heap_capacity()).0.size()
-        } else {
-            0
-        }
-    }
-
-    /// Element slots in the heap allocation, `0` while inline.
+    /// Entry slots in the heap allocation: the sorted capacity or the hash table's buckets.
     pub fn heap_slots(&self) -> usize {
-        self.heap_capacity()
+        match self.table() {
+            Some(table) => match table.capacity() {
+                0 => 0,
+                capacity if capacity < 8 => capacity + 1,
+                capacity => capacity / 7 * 8,
+            },
+            None => self.heap_capacity(),
+        }
     }
 
     /// Allocates room for `cap` elements, with an initialized header.
@@ -224,19 +313,23 @@ impl<T, const INLINE: usize> SortedSet<T, INLINE> {
         ptr
     }
 
-    /// Frees the heap allocation, without touching the elements (they are `Copy`, see the impls).
-    ///
-    /// # Safety
-    /// Must be spilled. Afterwards `data.heap` dangles until replaced.
-    unsafe fn deallocate(&mut self) {
-        // SAFETY: spilled, so `heap` was allocated by `allocate`/`set_capacity` with this layout.
-        unsafe {
-            let (layout, _) = Self::layout(self.heap_capacity());
-            alloc::dealloc(self.data.heap.as_ptr().cast(), layout);
+    /// Frees the heap allocation or hash table, without touching inline elements (they are `Copy`,
+    /// see the impls). Afterwards `data` dangles until replaced.
+    fn deallocate(&mut self) {
+        if self.is_hashed() {
+            // SAFETY: hashed, so `table` came from `Box::into_raw` and is owned by `self`.
+            drop(unsafe { Box::from_raw(self.data.table.as_ptr()) });
+        } else if self.is_spilled() {
+            // SAFETY: spilled, so `heap` was allocated by `allocate`/`set_capacity` with this
+            // layout.
+            unsafe {
+                let (layout, _) = Self::layout(self.heap_capacity());
+                alloc::dealloc(self.data.heap.as_ptr().cast(), layout);
+            }
         }
     }
 
-    /// Resizes the heap allocation to `cap` elements.
+    /// Resizes the sorted heap allocation to `cap` elements.
     ///
     /// # Safety
     /// Must be spilled, and `cap >= len`.
@@ -262,15 +355,26 @@ impl<T, const INLINE: usize> SortedSet<T, INLINE> {
     }
 
     pub fn clear(&mut self) {
-        if self.is_spilled() {
-            // SAFETY: spilled; `data` is replaced right after.
-            unsafe { self.deallocate() };
-        }
-        *self = Self::new();
+        self.deallocate();
+        self.len = 0;
+        self.data = Data {
+            inline: ManuallyDrop::new([const { MaybeUninit::uninit() }; INLINE]),
+        };
     }
 }
 
-impl<T: Copy + Ord, const INLINE: usize> SortedSet<T, INLINE> {
+impl<T: Copy + Ord + Hash, const INLINE: usize> SortedSet<T, INLINE> {
+    /// Bytes this set owns on the heap. Excludes heap memory owned by the elements.
+    pub fn heap_size(&self) -> usize {
+        if let Some(table) = self.table() {
+            size_of::<HashSet<T>>() + table.allocation_size()
+        } else if self.is_spilled() {
+            Self::layout(self.heap_capacity()).0.size()
+        } else {
+            0
+        }
+    }
+
     /// Builds a set from strictly ascending elements, with exactly their capacity.
     fn from_sorted_vec(elements: Vec<T>) -> Self {
         debug_assert!(elements.is_sorted_by(|a, b| a < b));
@@ -290,15 +394,21 @@ impl<T: Copy + Ord, const INLINE: usize> SortedSet<T, INLINE> {
     }
 
     pub fn contains(&self, value: &T) -> bool {
+        if let Some(table) = self.table() {
+            return table.contains_key(value);
+        }
         let (main, tail) = self.runs();
         main.binary_search(value).is_ok() || tail.binary_search(value).is_ok()
     }
 
     /// Inserts `value`, returning whether it was not in the set yet.
     pub fn insert(&mut self, value: T) -> bool {
+        if let Some(table) = self.table_mut() {
+            return table.insert(value, ()).is_none();
+        }
         let len = self.len();
         if !self.is_spilled() {
-            let pos = match self.as_slice().binary_search(&value) {
+            let pos = match self.sorted_slice().binary_search(&value) {
                 Ok(_) => return false,
                 Err(pos) => pos,
             };
@@ -319,7 +429,7 @@ impl<T: Copy + Ord, const INLINE: usize> SortedSet<T, INLINE> {
 
     /// Moves the inline elements to a new heap allocation of `cap` elements.
     fn spill(&mut self, cap: usize) {
-        debug_assert!(!self.is_spilled());
+        debug_assert!(!self.is_spilled() && !self.is_hashed());
         let len = self.len();
         let heap = Self::allocate(cap, len);
         // SAFETY: the inline elements are initialized; the new allocation has room for `len`.
@@ -339,15 +449,27 @@ impl<T: Copy + Ord, const INLINE: usize> SortedSet<T, INLINE> {
         let len = self.len();
         let main_len = self.main_len();
         let (main, tail) = self.runs();
-        let main_pos = match main.binary_search(&value) {
-            Ok(_) => return false,
-            Err(pos) => pos,
+        // Ascending insertions extend the main run without a search.
+        let appends_to_main = tail.is_empty() && main.last().is_none_or(|last| *last < value);
+        let tail_pos = if appends_to_main {
+            0
+        } else {
+            if main.binary_search(&value).is_ok() {
+                return false;
+            }
+            match tail.binary_search(&value) {
+                Ok(_) => return false,
+                Err(pos) => pos,
+            }
         };
-        let tail_pos = match tail.binary_search(&value) {
-            Ok(_) => return false,
-            Err(pos) => pos,
-        };
-        let appends_to_main = tail.is_empty() && main_pos == main_len;
+        if !appends_to_main && len - main_len >= MAX_TAIL {
+            if len >= MAX_MERGED_LEN {
+                self.convert_to_table();
+                return self.insert(value);
+            }
+            self.merge_tail();
+            return self.insert_spilled(value);
+        }
 
         if len == self.heap_capacity() {
             // SAFETY: spilled, and the new capacity is larger than `len`.
@@ -369,15 +491,10 @@ impl<T: Copy + Ord, const INLINE: usize> SortedSet<T, INLINE> {
             }
         }
         self.len += 1;
-
-        let len = len + 1;
-        if len - self.main_len() > MIN_TAIL.max(len.isqrt()) {
-            self.merge_tail();
-        }
         true
     }
 
-    /// Merges the tail into the main run.
+    /// Merges the tail into the main run. Must not be hashed.
     fn merge_tail(&mut self) {
         if !self.is_spilled() || self.main_len() == self.len() {
             return;
@@ -385,14 +502,28 @@ impl<T: Copy + Ord, const INLINE: usize> SortedSet<T, INLINE> {
         let len = self.len();
         // SAFETY: the first `len` elements are initialized and owned by `self`.
         let elements = unsafe { slice::from_raw_parts_mut(self.as_mut_ptr(), len) };
-        // Both runs are sorted and disjoint, which the stable sort merges in linear time.
-        elements.sort();
+        // The runs are disjoint, so the unstable sort's result is the same as a stable one's.
+        elements.sort_unstable();
         // SAFETY: spilled.
         unsafe { self.header_mut().main = len as u32 };
     }
 
+    /// Moves the sorted elements into a hash table.
+    fn convert_to_table(&mut self) {
+        let mut table = HashSet::with_capacity_and_hasher(self.len() * 2, Default::default());
+        table.extend(self.sorted_slice().iter().map(|&value| (value, ())));
+        self.deallocate();
+        self.data = Data {
+            table: NonNull::from(Box::leak(Box::new(table))),
+        };
+        self.len = HASHED;
+    }
+
     /// Removes `value`, returning whether it was in the set.
     pub fn remove(&mut self, value: &T) -> bool {
+        if let Some(table) = self.table_mut() {
+            return table.remove(value).is_some();
+        }
         let (main, tail) = self.runs();
         let main_len = main.len();
         let (at, in_main) = if let Ok(pos) = main.binary_search(value) {
@@ -422,6 +553,10 @@ impl<T: Copy + Ord, const INLINE: usize> SortedSet<T, INLINE> {
 
     /// Keeps only the elements for which `keep` returns true.
     pub fn retain(&mut self, mut keep: impl FnMut(&T) -> bool) {
+        if let Some(table) = self.table_mut() {
+            table.retain(|value, ()| keep(value));
+            return;
+        }
         let len = self.len();
         let main_len = self.main_len();
         let ptr = self.as_mut_ptr();
@@ -446,8 +581,14 @@ impl<T: Copy + Ord, const INLINE: usize> SortedSet<T, INLINE> {
         }
     }
 
-    /// Merges the tail and drops spare capacity, moving the elements inline if they fit.
+    /// Sorts the set into an exactly sized array (inline if it fits), for once it is complete.
     pub fn shrink_to_fit(&mut self) {
+        if let Some(table) = self.table() {
+            let mut elements: Vec<T> = table.keys().copied().collect();
+            elements.sort_unstable();
+            *self = Self::from_sorted_vec(elements);
+            return;
+        }
         if !self.is_spilled() {
             return;
         }
@@ -457,9 +598,9 @@ impl<T: Copy + Ord, const INLINE: usize> SortedSet<T, INLINE> {
             let mut inline = [const { MaybeUninit::uninit() }; INLINE];
             // SAFETY: copies the `len` initialized elements out before freeing the allocation.
             unsafe {
-                ptr::copy_nonoverlapping(self.as_ptr(), inline.as_mut_ptr().cast::<T>(), len);
-                self.deallocate();
-            }
+                ptr::copy_nonoverlapping(self.as_ptr(), inline.as_mut_ptr().cast::<T>(), len)
+            };
+            self.deallocate();
             self.data = Data {
                 inline: ManuallyDrop::new(inline),
             };
@@ -473,20 +614,17 @@ impl<T: Copy + Ord, const INLINE: usize> SortedSet<T, INLINE> {
 
 impl<T, const INLINE: usize> Drop for SortedSet<T, INLINE> {
     fn drop(&mut self) {
-        // The elements are `Copy` (every way to add one requires it), so only the allocation needs
-        // freeing.
-        if self.is_spilled() {
-            // SAFETY: spilled; `self` isn't used afterwards.
-            unsafe { self.deallocate() };
-        }
+        // Inline and sorted elements are `Copy` (every way to add one requires it), so only the
+        // allocation needs freeing; a hash table drops its own elements.
+        self.deallocate();
     }
 }
 
-impl<T: Copy + Ord, const INLINE: usize> Clone for SortedSet<T, INLINE> {
+impl<T: Copy + Ord + Hash, const INLINE: usize> Clone for SortedSet<T, INLINE> {
     fn clone(&self) -> Self {
-        let mut elements = self.as_slice().to_vec();
-        if self.main_len() != elements.len() {
-            elements.sort();
+        let mut elements: Vec<T> = self.iter().copied().collect();
+        if self.is_hashed() || self.main_len() != elements.len() {
+            elements.sort_unstable();
         }
         Self::from_sorted_vec(elements)
     }
@@ -494,19 +632,19 @@ impl<T: Copy + Ord, const INLINE: usize> Clone for SortedSet<T, INLINE> {
 
 impl<T: Debug, const INLINE: usize> Debug for SortedSet<T, INLINE> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_set().entries(self.as_slice()).finish()
+        f.debug_set().entries(self.iter()).finish()
     }
 }
 
-impl<T: Copy + Ord, const INLINE: usize> PartialEq for SortedSet<T, INLINE> {
+impl<T: Copy + Ord + Hash, const INLINE: usize> PartialEq for SortedSet<T, INLINE> {
     fn eq(&self, other: &Self) -> bool {
         self.len() == other.len() && self.iter().all(|value| other.contains(value))
     }
 }
 
-impl<T: Copy + Ord, const INLINE: usize> Eq for SortedSet<T, INLINE> {}
+impl<T: Copy + Ord + Hash, const INLINE: usize> Eq for SortedSet<T, INLINE> {}
 
-impl<T: Copy + Ord, const INLINE: usize> FromIterator<T> for SortedSet<T, INLINE> {
+impl<T: Copy + Ord + Hash, const INLINE: usize> FromIterator<T> for SortedSet<T, INLINE> {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
         let mut elements: Vec<T> = iter.into_iter().collect();
         elements.sort_unstable();
@@ -515,7 +653,9 @@ impl<T: Copy + Ord, const INLINE: usize> FromIterator<T> for SortedSet<T, INLINE
     }
 }
 
-impl<T: Copy + Ord, const N: usize, const INLINE: usize> From<[T; N]> for SortedSet<T, INLINE> {
+impl<T: Copy + Ord + Hash, const N: usize, const INLINE: usize> From<[T; N]>
+    for SortedSet<T, INLINE>
+{
     fn from(values: [T; N]) -> Self {
         values.into_iter().collect()
     }
@@ -523,7 +663,7 @@ impl<T: Copy + Ord, const N: usize, const INLINE: usize> From<[T; N]> for Sorted
 
 impl<'a, T, const INLINE: usize> IntoIterator for &'a SortedSet<T, INLINE> {
     type Item = &'a T;
-    type IntoIter = slice::Iter<'a, T>;
+    type IntoIter = Iter<'a, T>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
@@ -539,9 +679,10 @@ impl<T: Copy, const INLINE: usize> IntoIterator for SortedSet<T, INLINE> {
     }
 }
 
-/// An owning iterator over a [`SortedSet`]'s elements, in storage order.
+/// An owning iterator over a [`SortedSet`]'s elements.
 pub struct IntoIter<T, const INLINE: usize> {
     set: SortedSet<T, INLINE>,
+    /// The index of the next element, or the number of elements yielded from a hash table.
     next: usize,
 }
 
@@ -549,7 +690,12 @@ impl<T: Copy, const INLINE: usize> Iterator for IntoIter<T, INLINE> {
     type Item = T;
 
     fn next(&mut self) -> Option<T> {
-        let value = self.set.as_slice().get(self.next).copied();
+        let value = match self.set.table() {
+            // `nth` restarts a fresh iterator; fine for the rare owning iteration of a set that
+            // is still a hash table.
+            Some(table) => table.keys().nth(self.next).copied(),
+            None => self.set.sorted_slice().get(self.next).copied(),
+        };
         self.next += 1;
         value
     }
@@ -562,7 +708,7 @@ impl<T: Copy, const INLINE: usize> Iterator for IntoIter<T, INLINE> {
 
 impl<T: Copy, const INLINE: usize> ExactSizeIterator for IntoIter<T, INLINE> {}
 
-impl<T: Copy + Ord, const INLINE: usize> ShrinkToFit for SortedSet<T, INLINE> {
+impl<T: Copy + Ord + Hash, const INLINE: usize> ShrinkToFit for SortedSet<T, INLINE> {
     fn shrink_to_fit(&mut self) {
         SortedSet::shrink_to_fit(self);
     }
@@ -571,14 +717,14 @@ impl<T: Copy + Ord, const INLINE: usize> ShrinkToFit for SortedSet<T, INLINE> {
 impl<T: Encode, const INLINE: usize> Encode for SortedSet<T, INLINE> {
     fn encode<E: Encoder>(&self, encoder: &mut E) -> Result<(), EncodeError> {
         self.len().encode(encoder)?;
-        for value in self.as_slice() {
+        for value in self.iter() {
             value.encode(encoder)?;
         }
         Ok(())
     }
 }
 
-impl<Context, T: Decode<Context> + Copy + Ord, const INLINE: usize> Decode<Context>
+impl<Context, T: Decode<Context> + Copy + Ord + Hash, const INLINE: usize> Decode<Context>
     for SortedSet<T, INLINE>
 {
     fn decode<D: Decoder<Context = Context>>(decoder: &mut D) -> Result<Self, DecodeError> {
@@ -591,7 +737,8 @@ impl<Context, T: Decode<Context> + Copy + Ord, const INLINE: usize> Decode<Conte
         for _ in 0..len {
             elements.push(T::decode(decoder)?);
         }
-        // Sets are encoded in order, except for an unmerged tail or another set type's encoding.
+        // Complete sets are encoded in order; others (an unmerged tail, a hash table, another set
+        // type's encoding) are sorted here.
         if !elements.is_sorted_by(|a, b| a < b) {
             elements.sort_unstable();
             elements.dedup();
@@ -600,7 +747,7 @@ impl<Context, T: Decode<Context> + Copy + Ord, const INLINE: usize> Decode<Conte
     }
 }
 
-impl_borrow_decode!(SortedSet<T, INLINE>, T: Decode<__Context> + Copy + Ord, const INLINE: usize);
+impl_borrow_decode!(SortedSet<T, INLINE>, T: Decode<__Context> + Copy + Ord + Hash, const INLINE: usize);
 
 #[cfg(test)]
 mod tests {
@@ -623,12 +770,15 @@ mod tests {
 
     fn assert_matches<const INLINE: usize>(set: &SortedSet<u32, INLINE>, model: &BTreeSet<u32>) {
         assert_eq!(set.len(), model.len());
-        let mut elements = set.as_slice().to_vec();
+        let mut elements: Vec<u32> = set.iter().copied().collect();
         elements.sort_unstable();
         assert!(elements.iter().eq(model.iter()));
-        let (main, tail) = set.runs();
-        assert!(main.is_sorted_by(|a, b| a < b));
-        assert!(tail.is_sorted_by(|a, b| a < b));
+        if !set.is_hashed() {
+            let (main, tail) = set.runs();
+            assert!(main.is_sorted_by(|a, b| a < b));
+            assert!(tail.is_sorted_by(|a, b| a < b));
+            assert!(tail.len() <= MAX_TAIL);
+        }
     }
 
     fn random_ops<const INLINE: usize>(seed: u64, ops: usize, range: u32) {
@@ -644,7 +794,11 @@ mod tests {
                     set.retain(|v| v % 7 != value % 7);
                     model.retain(|v| v % 7 != value % 7);
                 }
-                _ => set.shrink_to_fit(),
+                _ => {
+                    if rng.next(4) == 0 {
+                        set.shrink_to_fit();
+                    }
+                }
             }
             assert_eq!(set.contains(&value), model.contains(&value));
             assert_matches(&set, &model);
@@ -652,17 +806,18 @@ mod tests {
         let cloned = set.clone();
         assert_eq!(cloned, set);
         assert_matches(&cloned, &model);
+        let mut owned: Vec<_> = set.clone().into_iter().collect();
+        owned.sort_unstable();
+        assert!(owned.iter().eq(model.iter()));
         set.shrink_to_fit();
+        assert!(!set.is_hashed());
         assert_eq!(set.main_len(), set.len());
         if set.len() > INLINE {
             assert_eq!(set.heap_slots(), set.len());
         } else {
             assert!(!set.is_spilled());
         }
-        assert_matches(&set, &model);
-        let mut owned: Vec<_> = set.into_iter().collect();
-        owned.sort_unstable();
-        assert!(owned.iter().eq(model.iter()));
+        assert!(set.iter().copied().eq(model.iter().copied()));
     }
 
     #[test]
@@ -681,20 +836,23 @@ mod tests {
         for i in 0..1000 {
             assert!(set.insert(i));
         }
+        assert!(!set.is_hashed());
         assert_eq!(set.main_len(), 1000);
-        assert!(set.as_slice().iter().copied().eq(0..1000));
+        assert!(set.iter().copied().eq(0..1000));
     }
 
     #[test]
-    fn tail_stays_short() {
+    fn large_random_sets_are_hashed_until_shrunk() {
         let mut set = SortedSet::<u32, 0>::new();
-        let n = if cfg!(miri) { 2_000 } else { 100_000 };
+        let n = if cfg!(miri) { 500 } else { 50_000 };
         for i in (0..n).rev() {
             set.insert(i);
-            assert!(set.len() - set.main_len() <= MIN_TAIL.max(set.len().isqrt()));
         }
+        assert!(set.is_hashed());
+        assert_eq!(set.len(), n as usize);
         set.shrink_to_fit();
-        assert!(set.as_slice().iter().copied().eq(0..n));
+        assert!(!set.is_hashed());
+        assert!(set.iter().copied().eq(0..n));
         assert_eq!(
             set.heap_size(),
             SortedSet::<u32, 0>::layout(n as usize).0.size()
@@ -707,7 +865,7 @@ mod tests {
         set.retain(|&v| v < 3);
         set.shrink_to_fit();
         assert!(!set.is_spilled());
-        assert_eq!(set.as_slice(), &[0, 1, 2]);
+        assert_eq!(set.sorted_slice(), &[0, 1, 2]);
         assert_eq!(set.heap_size(), 0);
     }
 
@@ -735,6 +893,6 @@ mod tests {
         let (decoded, _): (SortedSet<u32, 2>, _) =
             bincode::decode_from_slice(&from_auto, config).unwrap();
         assert_eq!(decoded, set);
-        assert_eq!(decoded.as_slice(), &[1, 3, 5, 7, 9]);
+        assert_eq!(decoded.sorted_slice(), &[1, 3, 5, 7, 9]);
     }
 }

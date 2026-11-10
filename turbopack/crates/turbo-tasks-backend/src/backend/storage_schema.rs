@@ -1039,7 +1039,7 @@ where
         self.extend(items)
     }
 }
-impl<V: Copy + Ord, const I: usize> MergeRestore for SortedSet<V, I> {
+impl<V: Copy + Ord + Hash, const I: usize> MergeRestore for SortedSet<V, I> {
     type Item = V;
     fn merge_restore(&mut self, items: impl IntoIterator<Item = Self::Item>) {
         self.extend(items)
@@ -1091,7 +1091,7 @@ impl<T: IsTransient + Hash + Eq, const I: usize> DropPartial for AutoSet<T, I> {
     }
 }
 
-impl<T: IsTransient + Copy + Ord, const I: usize> DropPartial for SortedSet<T, I> {
+impl<T: IsTransient + Copy + Ord + Hash, const I: usize> DropPartial for SortedSet<T, I> {
     fn drop_partial(&mut self) -> DropPartialOutcome {
         self.retain(|t| t.is_transient());
         if self.is_empty() {

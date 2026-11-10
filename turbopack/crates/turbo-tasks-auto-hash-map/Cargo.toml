@@ -22,3 +22,7 @@ turbo-tasks-malloc = { workspace = true }
 [[bench]]
 name = "tiny_vec"
 harness = false
+
+[[bench]]
+name = "sorted_set"
+harness = false
